@@ -50,33 +50,49 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
     render_images = []
-    gt_list = []
-    render_list = []
     print("point nums:",gaussians._xyz.shape[0])
+    # S4GS patch: every PNG is written as soon as it is rendered (4 writer threads, at most ~64 images in flight).
+    # The original kept all renders and GT images in lists until the end, on the GPU for PanopticSports:
+    # 2 x 6.3 MB x 2200 test images of a HiFi4G scene does not fit into 24 GB. The files are the same
+    # (00000.png ..., torchvision.utils.save_image of the same tensors); a failed write now raises.
+    writer = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    pending = []
+    def write_image(image, count, path):
+        torchvision.utils.save_image(image, os.path.join(path, '{0:05d}'.format(count) + ".png"))
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         if idx == 0:time1 = time()
-        
+
         rendering = render(view, gaussians, pipeline, background, cam_type=cam_type)["render"]
 
         render_images.append(to8b(rendering).transpose(1,2,0))
-        render_list.append(rendering)
+        pending.append(writer.submit(write_image, rendering.cpu(), idx, render_path))
         if name in ["train", "test"]:
             if cam_type != "PanopticSports":
                 gt = view.original_image[0:3, :, :]
             else:
-                gt  = view['image'].cuda()
-            gt_list.append(gt)
+                gt  = view['image']
+            pending.append(writer.submit(write_image, gt.cpu(), idx, gts_path))
+        if len(pending) > 64:
+            for job in pending[:32]:
+                job.result()
+            pending = pending[32:]
 
     time2=time()
     print("FPS:",(len(views)-1)/(time2-time1))
 
-    multithread_write(gt_list, gts_path)
-    multithread_write(render_list, render_path)
-    
+    for job in pending:
+        job.result()
+    writer.shutdown()
+
     scene_name = os.path.basename(model_path)
     test_case_name = os.path.basename(os.path.split(model_path)[0])
 
-    imageio.mimwrite(os.path.join(model_path, name, "ours_{}".format(iteration), test_case_name + '_' + scene_name + '_' + name + '_' + 'video_rgb.mp4'), render_images, fps=30)
+    # S4GS patch: the mp4 is a convenience; it cannot be written when the frames differ in size (HiFi4G test
+    # cameras have different image sizes), and that must not abort the run after the PNGs are written.
+    try:
+        imageio.mimwrite(os.path.join(model_path, name, "ours_{}".format(iteration), test_case_name + '_' + scene_name + '_' + name + '_' + 'video_rgb.mp4'), render_images, fps=30)
+    except Exception as e:
+        print("video not written:", e)
 
 
 def render_set_canonical(model_path, name, iteration, views, gaussians, pipeline, background, cam_type):

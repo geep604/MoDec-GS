@@ -20,6 +20,8 @@ from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec
 from scene.hyper_loader import Load_hyper_data, format_hyper_data
 import torchvision.transforms as transforms
 import copy
+import time as time_module  # S4GS patch: readPanopticmeta uses `time` for the frame time
+from concurrent.futures import ThreadPoolExecutor  # S4GS patch
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import torch
@@ -482,7 +484,7 @@ def readdynerfInfo(datadir,use_bg_points,eval):
                            )
     return scene_info
 
-def setup_camera(w, h, k, w2c, near=0.01, far=100):
+def setup_camera(w, h, k, w2c, near=0.01, far=100, bg=(0, 0, 0)):  # S4GS patch: bg (was always black)
     from diff_gaussian_rasterization import GaussianRasterizationSettings as Camera
     fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
     w2c = torch.tensor(w2c).cuda().float()
@@ -498,7 +500,7 @@ def setup_camera(w, h, k, w2c, near=0.01, far=100):
         image_width=w,
         tanfovx=w / (2 * fx),
         tanfovy=h / (2 * fy),
-        bg=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"),
+        bg=torch.tensor(bg, dtype=torch.float32, device="cuda"),
         scale_modifier=1.0,
         viewmatrix=w2c,
         projmatrix=full_proj,
@@ -534,13 +536,49 @@ def plot_camera_orientations(cam_list, xyz):
     ax.set_zlabel('Z Axis')
     plt.savefig("output.png")
     # breakpoint()
+def _load_panoptic_image(path, size):
+    """S4GS patch: image as a uint8 (3, H, W) tensor, resized to size = (w, h) if it has another size."""
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        if image.size != tuple(size):
+            image = image.resize(tuple(size), Image.BICUBIC)
+        return torch.from_numpy(np.array(image)).permute(2, 0, 1).contiguous()
+
+class PanopticSample(dict):
+    """S4GS patch: one {"camera", "time", "image"} sample of the PanopticSports reader.
+    The original reader kept every image as float32 (3, H, W) (8.4 MB at 969x541: ~120 GB for the 14,000 training
+    images of a HiFi4G scene, twice that after train.py deep-copies the list). Here "image" is stored as uint8
+    (or as (path, size) when it does not fit in MODECGS_PRELOAD_GB, see readPanopticmeta) and handed out as the same
+    float32 values in [0, 1] the original produced. Samples are never modified, so deepcopy shares them."""
+    def __getitem__(self, key):
+        value = dict.__getitem__(self, key)
+        if key != "image":
+            return value
+        if isinstance(value, tuple):
+            value = _load_panoptic_image(*value)
+        return value.float() / 255.0
+
+    def __deepcopy__(self, memo):
+        return self
+
+# uint8 bytes of the images read so far by readPanopticmeta, against the MODECGS_PRELOAD_GB budget (all meta files)
+_panoptic_preloaded_bytes = 0
+
 def readPanopticmeta(datadir, json_path):
+    global _panoptic_preloaded_bytes
     with open(os.path.join(datadir,json_path)) as f:
         test_meta = json.load(f)
     w = test_meta['w']
     h = test_meta['h']
+    # S4GS patch. Optional keys of the meta files (a meta file in the original format, with integer w and h
+    # and no "bg", reads exactly as before):
+    #   w, h : int (one size for all) or nested lists like "k" (a size per camera and time point);
+    #          images of another size are resized to it, so the K of the meta must be for that size
+    #   bg   : rasterizer background colour (default black, as before)
+    bg = test_meta.get('bg', [0, 0, 0])
     max_time = len(test_meta['fn'])
     cam_infos = []
+    jobs = []
     for index in range(len(test_meta['fn'])):
         focals = test_meta['k'][index]
         w2cs = test_meta['w2c'][index]
@@ -548,18 +586,29 @@ def readPanopticmeta(datadir, json_path):
         cam_ids = test_meta['cam_id'][index]
 
         time = index / len(test_meta['fn'])
-        for focal, w2c, fn, cam in zip(focals, w2cs, fns, cam_ids):
+        for i, (focal, w2c, fn, cam) in enumerate(zip(focals, w2cs, fns, cam_ids)):
             image_path = os.path.join(datadir,"ims")
             image_name=fn
-            image = Image.open(os.path.join(datadir,"ims",fn))
-            im_data = np.array(image.convert("RGBA"))
-            im_data = PILtoTorch(im_data,None)[:3,:,:]
-            camera = setup_camera(w, h, focal, w2c)
-            cam_infos.append({
-                "camera":camera,
-                "time":time,
-                "image":im_data})
-            
+            size = (w[index][i] if isinstance(w, list) else w, h[index][i] if isinstance(h, list) else h)
+            camera = setup_camera(size[0], size[1], focal, w2c, bg=bg)
+            cam_infos.append(PanopticSample(camera=camera, time=time, image=None))
+            jobs.append((os.path.join(datadir,"ims",fn), size))
+    # decode the images: all at once into uint8 tensors, unless they would exceed the memory budget
+    # (MODECGS_PRELOAD_GB, default 40, shared by the train and test meta files); then they are read when used
+    nbytes = sum(3 * s[0] * s[1] for _, s in jobs)
+    budget = float(os.environ.get("MODECGS_PRELOAD_GB", "40")) * 2 ** 30
+    t0 = time_module.time()
+    if _panoptic_preloaded_bytes + nbytes <= budget:
+        with ThreadPoolExecutor(int(os.environ.get("MODECGS_LOAD_THREADS", "8"))) as pool:
+            images = list(pool.map(lambda job: _load_panoptic_image(*job), jobs))
+        _panoptic_preloaded_bytes += nbytes
+        print("PanopticSports %s: %d images preloaded as uint8 (%.1f GB) in %.0f s" % (json_path, len(jobs), nbytes / 2 ** 30, time_module.time() - t0))
+    else:
+        images = jobs
+        print("PanopticSports %s: %d images (%.1f GB as uint8) are read from disk when used (MODECGS_PRELOAD_GB=%s)" % (json_path, len(jobs), nbytes / 2 ** 30, os.environ.get("MODECGS_PRELOAD_GB", "40")))
+    for sample, image in zip(cam_infos, images):
+        dict.__setitem__(sample, "image", image)
+
     cam_centers = np.linalg.inv(test_meta['w2c'][0])[:, :3, 3]  # Get scene radius
     scene_radius = 1.1 * np.max(np.linalg.norm(cam_centers - np.mean(cam_centers, 0)[None], axis=-1))
     return cam_infos, max_time, scene_radius 
