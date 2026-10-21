@@ -62,10 +62,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         if idx == 0:time1 = time()
 
-        rendering = render(view, gaussians, pipeline, background, cam_type=cam_type)["render"]
+        rendering = render(view, gaussians, pipeline, background, cam_type=cam_type)["render"].cpu()  # one copy to the CPU, as to8b did
 
         render_images.append(to8b(rendering).transpose(1,2,0))
-        pending.append(writer.submit(write_image, rendering.cpu(), idx, render_path))
+        pending.append(writer.submit(write_image, rendering, idx, render_path))
         if name in ["train", "test"]:
             if cam_type != "PanopticSports":
                 gt = view.original_image[0:3, :, :]
