@@ -259,6 +259,104 @@ def generateCamerasFromTransforms(path, template_transformsfile, extension, maxt
                             image_path=None, image_name=None, width=image.shape[1], height=image.shape[2],
                             time = time, mask=None))
     return cam_infos
+# S4GS patch: the Blender / D-NeRF reader holds the images as uint8 (up to MODECGS_PRELOAD_GB, the rest is read from
+# disk when used) instead of one float32 tensor per image. The original kept 7.7 MB per image, train.py builds a Camera
+# for every training image (original_image: a second float tensor) and deep-copies that list (a third one): ~52 GB for
+# a 120-frame Mixamo clip (17-19 training cameras); one copy alone is 219 GB for the 28,500 training images of a
+# 1500-frame clip. What the trainer and render.py get is the same, bit for bit, values and strides (BlenderImage.load,
+# BlenderCamera.original_image).
+def _read_blender_image(image_path, white_background):
+    """The uint8 (800, 800, 3) array that PILtoTorch divided by 255: the lines readCamerasFromTransforms ran for every
+    image (PIL read, RGBA composited over the background colour in float64, the cast to np.byte, PIL resize), unchanged."""
+    with Image.open(image_path) as image:
+        im_data = np.array(image.convert("RGBA"))
+
+    bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
+
+    norm_data = im_data / 255.0
+    arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+    image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+    return np.array(image.resize((800, 800)))
+
+class BlenderImage:
+    """S4GS patch: CameraInfo.image of the Blender / D-NeRF reader. The uint8 array once preloaded
+    (_preload_blender_images), otherwise read from the file each time it is used. Never modified after the reader
+    returned, so deepcopy shares it (train.py deep-copies the camera list)."""
+    shape = (3, 800, 800)  # of load(): every image is resized to 800x800
+
+    def __init__(self, path, white_background):
+        self.path = path
+        self.white_background = white_background
+        self.array = None   # uint8 (800, 800, 3) when preloaded
+        self.divide = True  # array.max() != 1, see load()
+
+    def preload(self, out):
+        """Decode now into `out`, a uint8 (800, 800, 3) slot of a buffer allocated by _preload_blender_images."""
+        out[...] = _read_blender_image(self.path, self.white_background)
+        self.array = out
+        self.divide = bool(out.max() != 1)
+
+    def load(self):
+        """float32 (3, 800, 800) in [0, 1]: the tensor the original reader put in CameraInfo.image (PILtoTorch)."""
+        if self.array is None:
+            array = _read_blender_image(self.path, self.white_background)
+            divide = array.max() != 1
+        else:
+            array, divide = self.array, self.divide
+        image = torch.from_numpy(array)
+        if divide:  # PILtoTorch leaves an image whose maximum is exactly 1 undivided (a mask convention of 3DGS)
+            image = image / 255.0
+        return image.permute(2, 0, 1)
+
+    def __deepcopy__(self, memo):
+        return self
+
+class BlenderCamera(Camera):
+    """S4GS patch: a Camera whose original_image (the ground truth) is built from a BlenderImage each time it is read,
+    instead of being kept as a float32 tensor. Everything else is Camera's. The image goes through the same two
+    operations Camera.__init__ applies (clamp, multiplication by ones), so layout and values are those of a Camera
+    built from BlenderImage.load()."""
+    _blender_image = None  # a class default: Camera.__init__ runs with a 1x1 stand-in image, original_image is that
+
+    def __init__(self, blender_image, **kwargs):
+        super().__init__(image=torch.zeros(3, 1, 1), **kwargs)
+        self._blender_image = blender_image
+        self._original_image = None
+        self.image_height, self.image_width = blender_image.shape[1], blender_image.shape[2]
+
+    @property
+    def original_image(self):
+        if self._blender_image is None:
+            return self._original_image
+        image = self._blender_image.load().clamp(0.0, 1.0)[:3,:,:]
+        image *= torch.ones((1, self.image_height, self.image_width))
+        return image
+
+    @original_image.setter
+    def original_image(self, value):  # also what Camera.__init__ assigns; assigning a tensor makes the camera eager
+        self._original_image = value
+        self._blender_image = None
+
+def _preload_blender_images(images, json_path):
+    """Decode the first images that fit in what is left of the MODECGS_PRELOAD_GB budget (default 40; the counter
+    _panoptic_preloaded_bytes is shared with readPanopticmeta, train and test images alike); the others are read from
+    their files when used."""
+    global _panoptic_preloaded_bytes
+    each = 3 * 800 * 800
+    budget = float(os.environ.get("MODECGS_PRELOAD_GB", "40")) * 2 ** 30
+    n = int(max(0, min(len(images), (budget - _panoptic_preloaded_bytes) // each)))
+    t0 = time_module.time()
+    if n:
+        # The images go into buffers of 256 allocated here, not into arrays the loader threads allocate one by one:
+        # those end up between the float64 temporaries in the threads' malloc arenas and the process holds 25-30% more
+        # than the uint8 bytes (1 GB on top of 4.6 GB for 2400 images).
+        buffers = [np.empty((min(256, n - k), 800, 800, 3), np.uint8) for k in range(0, n, 256)]
+        with ThreadPoolExecutor(int(os.environ.get("MODECGS_LOAD_THREADS", "8"))) as pool:
+            list(pool.map(lambda k: images[k].preload(buffers[k // 256][k % 256]), range(n)))
+        _panoptic_preloaded_bytes += n * each
+    print("Blender %s: %d of %d images preloaded as uint8 (%.1f GB) in %.0f s, %d are read from disk when used (MODECGS_PRELOAD_GB=%s)"
+          % (json_path, n, len(images), n * each / 2 ** 30, time_module.time() - t0, len(images) - n, os.environ.get("MODECGS_PRELOAD_GB", "40")))
+
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", mapper = {}):
     cam_infos = []
 
@@ -279,16 +377,11 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
-            image = Image.open(image_path)
-
-            im_data = np.array(image.convert("RGBA"))
-
-            bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
-
-            norm_data = im_data / 255.0
-            arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
-            image = PILtoTorch(image,(800,800))
+            # S4GS patch: the image is decoded later (preload or when used, see BlenderImage); it used to be read here,
+            # composited and resized by the lines now in _read_blender_image. A missing file still fails here.
+            if not os.path.isfile(image_path):
+                raise FileNotFoundError(image_path)
+            image = BlenderImage(image_path, white_background)
             fovy = focal2fov(fov2focal(fovx, image.shape[1]), image.shape[2])
             FovY = fovy 
             FovX = fovx
@@ -297,6 +390,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                             image_path=image_path, image_name=image_name, width=image.shape[1], height=image.shape[2],
                             time = time, mask=None))
             
+    _preload_blender_images([cam_info.image for cam_info in cam_infos], transformsfile)  # S4GS patch
     return cam_infos
 def read_timeline(path):
     with open(os.path.join(path, "transforms_train.json")) as json_file:
