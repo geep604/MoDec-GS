@@ -507,7 +507,7 @@ def setup_camera(w, h, k, w2c, near=0.01, far=100, bg=(0, 0, 0)):  # S4GS patch:
         sh_degree=0,
         campos=cam_center,
         prefiltered=False,
-        debug=True
+        debug=False  # S4GS patch: was True (a cudaDeviceSynchronize after every rasterizer kernel); no effect on results, only speed
     )
     return cam
 def plot_camera_orientations(cam_list, xyz):
